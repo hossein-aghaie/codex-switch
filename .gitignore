@@ -1,0 +1,16 @@
+# Local Codex credentials and switcher state must never enter the repository.
+auth.json
+*.dpapi
+pending
+switcher.lock
+login-*/
+CodexLocalSwitcher/
+.codex/
+
+# Local archives and editor/OS noise.
+*.zip
+*.log
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
