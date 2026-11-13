@@ -260,16 +260,42 @@ function Start-CasDesktop($Installation) {
     $null=Start-Process -FilePath 'explorer.exe' -ArgumentList ('shell:AppsFolder\'+$Installation.Aumid) -PassThru
 }
 
+function Get-CasDesktopProcesses($Installation) {
+    $packagePrefix=$Installation.Root.TrimEnd('\')+'\'
+    foreach ($process in @(Get-CasProcesses $Installation)) {
+        try {
+            $name=[string]$process.ProcessName
+            $path=[string]$process.Path
+            if ($name -match '^(?i:chatgpt|codex)$' -and
+                $path.StartsWith($packagePrefix,[StringComparison]::OrdinalIgnoreCase) -and
+                (-not $Installation.Cli -or -not [string]::Equals($path,$Installation.Cli,[StringComparison]::OrdinalIgnoreCase))) {
+                Write-Output $process
+            }
+        } catch { }
+    }
+}
+
 function Wait-CasDesktopReady($Installation) {
-    # First launch after an update can take substantially longer than six seconds.
-    $deadline=[DateTime]::UtcNow.AddSeconds(35)
+    # The packaged process can be alive before its WPF window receives a handle.
+    $deadline=[DateTime]::UtcNow.AddSeconds(60)
+    $stableSamples=0
     while ([DateTime]::UtcNow -lt $deadline) {
-        foreach ($process in @(Get-CasProcesses $Installation)) {
+        try { $desktop=@(Get-CasDesktopProcesses $Installation) }
+        catch {
+            # Windows can briefly deny a path lookup while a packaged app starts.
+            if ($_.Exception.Message -notlike 'CAS|UNKNOWNPROCESS|*') { throw }
+            $desktop=@()
+        }
+        foreach ($process in $desktop) {
             try { if ($process.MainWindowHandle -ne [IntPtr]::Zero) { return } } catch { }
         }
+        if ($desktop.Count -gt 0) {
+            $stableSamples++
+            if ($stableSamples -ge 5) { return }
+        } else { $stableSamples=0 }
         Wait-Cas 300
     }
-    throw 'CAS|LAUNCH|No Codex desktop window appeared. Previous local login will be restored.'
+    throw 'CAS|LAUNCH|No stable Codex desktop process appeared. Previous local login will be restored.'
 }
 
 function Sync-CasLive {
@@ -346,7 +372,7 @@ function Invoke-CasSwitch([int]$Slot, $Installation, [switch]$Force) {
         Start-CasDesktop $Installation
         Wait-CasDesktopReady $Installation
         Wait-Cas 2500
-        if (@(Get-CasProcesses $Installation).Count -eq 0) { throw 'CAS|LAUNCH|Codex did not stay open. Previous local login will be restored.' }
+        if (@(Get-CasDesktopProcesses $Installation).Count -eq 0) { throw 'CAS|LAUNCH|Codex did not stay open. Previous local login will be restored.' }
         $after=Read-CasLive
         if ((Get-CasAccount $after).Id -ne $target.Id) { throw 'CAS|VERIFY|Codex changed the local account unexpectedly.' }
         Save-CasSecret $path $after

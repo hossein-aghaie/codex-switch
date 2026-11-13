@@ -92,19 +92,43 @@ try {
     # Mock only OS app lifecycle. Switching uses real files and transactions.
     $script:FakeRunning=$false
     $script:FakeLaunch='success'
-    function Stop-CasDesktop($Installation,[switch]$Force) { $script:FakeRunning=$false }
+    $script:FakePolls=0
+    $script:FakeStopCalls=0
+    function Stop-CasDesktop($Installation,[switch]$Force) { $script:FakeStopCalls++; $script:FakeRunning=$false }
     function Start-CasDesktop($Installation) {
         if ($script:FakeLaunch -eq 'fail') { throw 'CAS|LAUNCH|Synthetic launch failure' }
         $script:FakeRunning=$true
+        $script:FakePolls=0
         if ($script:FakeLaunch -eq 'wrong-account') { Write-CasAtomic $script:CasAuth (New-TestAuth 'eve') }
     }
-    function Get-CasProcesses($Installation) { if ($script:FakeRunning) { [pscustomobject]@{Id=123;ProcessName='fake-codex';MainWindowHandle=[IntPtr]::new(1)} } }
+    function Get-CasProcesses($Installation) {
+        if ($script:FakeRunning) {
+            $script:FakePolls++
+            if ($script:FakeLaunch -eq 'cli-only') {
+                [pscustomobject]@{Id=124;ProcessName='codex';Path=$Installation.Cli;MainWindowHandle=[IntPtr]::Zero}
+                return
+            }
+            if ($script:FakeLaunch -eq 'delayed-process' -and $script:FakePolls -le 3) { return }
+            if ($script:FakeLaunch -eq 'delayed-path' -and $script:FakePolls -le 3) { throw 'CAS|UNKNOWNPROCESS|Synthetic startup path delay' }
+            $handle=if ($script:FakeLaunch -in @('delayed-process','delayed-window','delayed-path')) { [IntPtr]::Zero } else { [IntPtr]::new(1) }
+            [pscustomobject]@{Id=123;ProcessName='ChatGPT';Path=($Installation.Root+'\app\ChatGPT.exe');MainWindowHandle=$handle}
+        }
+    }
     function Wait-Cas([int]$Milliseconds) { }
     $fakeInstall=[pscustomobject]@{Root='fake';Aumid='fake!App';Cli=(Join-Path $testRoot 'fake.exe')}
     [IO.File]::WriteAllBytes($fakeInstall.Cli,[byte[]]@(1))
+    $script:FakeLaunch='cli-only'; $script:FakeRunning=$true
+    Assert-Test (@(Get-CasDesktopProcesses $fakeInstall).Count -eq 0) 'CLI process cannot satisfy desktop readiness'
+    $script:FakeLaunch='success'; $script:FakeRunning=$false
     $selected=Invoke-CasSwitch 2 $fakeInstall
     Assert-Test ($selected.Email -eq 'bob@example.test' -and (Get-CasAccount (Read-CasLive)).Id -eq (Get-CasAccount $b).Id) 'Full switch commits selected local identity'
     Assert-Test (-not (Get-CasStatus).Pending) 'Successful switch clears pending marker'
+    foreach ($slowLaunch in @('delayed-window','delayed-process','delayed-path')) {
+        $script:FakeLaunch=$slowLaunch
+        $script:FakeStopCalls=0
+        $selected=Invoke-CasSwitch 2 $fakeInstall
+        Assert-Test ($selected.Email -eq 'bob@example.test' -and -not (Get-CasStatus).Pending -and $script:FakePolls -ge 5 -and $script:FakeStopCalls -eq 1) ('Late desktop startup succeeds without rollback: '+$slowLaunch)
+    }
     $script:FakeLaunch='fail'
     Assert-Throws { Invoke-CasSwitch 1 $fakeInstall } 'LAUNCH' 'Launch failure reported'
     Assert-Test ((Get-CasAccount (Read-CasLive)).Email -eq 'bob@example.test') 'Launch failure automatically rolls back auth'
