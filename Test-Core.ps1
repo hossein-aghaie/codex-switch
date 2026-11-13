@@ -44,7 +44,7 @@ try {
     Assert-Test ((Get-CasAccount $a).Email -eq 'alice@example.test') 'Decode identity without exposing credentials'
     Assert-Test ((Get-CasAccount $a).Id -eq (Get-CasAccount $freshA).Id) 'Identity survives token refresh'
     Assert-Throws { Get-CasAccount ([Text.Encoding]::UTF8.GetBytes('{broken')) } 'FORMAT' 'Malformed auth is rejected'
-    Assert-Test ((Get-CasStatus).Slots[0].State -eq 'empty') 'Empty slot state'
+    Assert-Test (@((Get-CasStatus).Slots).Count -eq 0 -and (Get-CasNextSlot) -eq 1) 'Empty account list starts at first slot'
     $null=Save-CasAccount 1 $a
     $stored=[IO.File]::ReadAllBytes((Get-CasSlotPath 1))
     Assert-Test ([Text.Encoding]::UTF8.GetString($stored) -notlike '*alice@example.test*') 'Saved envelope has no plaintext email'
@@ -53,6 +53,14 @@ try {
     Assert-Throws { Save-CasAccount 1 $b } 'DIFFERENT' 'Different identity cannot replace a filled slot'
     $null=Save-CasAccount 2 $b
     Assert-Test ((Get-CasStatus).Slots[1].Email -eq 'bob@example.test') 'Second account displayed'
+    $legacyOne=[IO.File]::ReadAllBytes((Get-CasSlotPath 1))
+    $legacyTwo=[IO.File]::ReadAllBytes((Get-CasSlotPath 2))
+    Assert-Test ((Get-CasNextSlot) -eq 3) 'Next account number follows the two existing profiles'
+    $null=Save-CasAccount (Get-CasNextSlot) (New-TestAuth 'carol')
+    $null=Save-CasAccount (Get-CasNextSlot) (New-TestAuth 'dana')
+    Assert-Test (@((Get-CasStatus).Slots).Count -eq 4 -and (Get-CasStatus).Slots[3].Email -eq 'dana@example.test') 'Four accounts enumerate without a fixed limit'
+    Assert-Test ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 1))) -eq [Convert]::ToBase64String($legacyOne) -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 2))) -eq [Convert]::ToBase64String($legacyTwo)) 'Adding accounts leaves both legacy profile files byte-for-byte intact'
+    Assert-Throws { Save-CasAccount 5 (New-TestAuth 'carol') } 'DUPLICATE' 'Duplicate account blocked across all saved profiles'
     foreach ($source in @('', "model = 'x'`n", "# comment`n[profiles.dev]`nmodel = 'x'`n")) {
         $result=ConvertTo-CasFileConfig $source
         Assert-Test ($result.EndsWith($source) -and $result.StartsWith('cli_auth_credentials_store = "file"')) 'Root file setting inserted without changing other text'
@@ -74,6 +82,10 @@ try {
     [IO.File]::SetLastWriteTimeUtc($script:CasAuth,[DateTime]::UtcNow.AddMinutes(1))
     Sync-CasLive
     Assert-Test ([Text.Encoding]::UTF8.GetString((Read-CasSecret (Get-CasSlotPath 1))) -like '*refresh-LATEST*') 'New live refresh token saved before switching'
+    Write-CasAtomic $script:CasAuth (New-TestAuth 'eve')
+    Sync-CasLive
+    Assert-Test ((Get-CasNextSlot) -eq 6 -and (Get-CasStatus).Slots[4].Email -eq 'eve@example.test') 'Unknown live login is preserved as a new account'
+    Write-CasAtomic $script:CasAuth (New-TestAuth 'alice' 'refresh-LATEST')
     $pkg='C:\Program Files\WindowsApps\OpenAI.Codex_1'
     Assert-Test (Test-CasProcess 'ChatGPT' ($pkg+'\app\ChatGPT.exe') $pkg '') 'Packaged integrated desktop detected by path'
     Assert-Test (-not (Test-CasProcess 'ChatGPT' 'C:\Other\ChatGPT.exe' $pkg '')) 'Unrelated ChatGPT app excluded'
@@ -89,6 +101,29 @@ try {
     Assert-Test ([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:CasAuth)) -eq $authBefore) 'Recovery restores exact previous auth bytes'
     Assert-Test ([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:CasConfig)) -eq $configBefore) 'Recovery restores exact previous config bytes'
     Assert-Test (-not (Get-CasStatus).Pending) 'Recovery clears interrupted-transaction marker'
+    Assert-Throws { Restore-CasTransaction } 'RECOVERY' 'A completed switch cannot be restored accidentally'
+    Assert-Throws { Complete-CasPendingWithCurrent } 'RECOVERY' 'Current account cannot be confirmed without an interrupted switch'
+    $firstSaved=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 1)))
+    $secondSaved=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 2)))
+    Backup-CasTransaction
+    Write-CasAtomic $script:CasAuth $b
+    $currentBefore=[Convert]::ToBase64String([IO.File]::ReadAllBytes($script:CasAuth))
+    $kept=Complete-CasPendingWithCurrent
+    Assert-Test ($kept.Email -eq 'bob@example.test' -and -not (Get-CasStatus).Pending) 'Confirmed current account clears interrupted marker'
+    Assert-Test ([Convert]::ToBase64String([IO.File]::ReadAllBytes($script:CasAuth)) -eq $currentBefore -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($script:CasConfig)) -eq $configBefore) 'Keeping current account never rewrites live auth or config'
+    Assert-Test ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 1))) -eq $firstSaved -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Get-CasSlotPath 2))) -eq $secondSaved) 'Keeping current account leaves both saved profiles untouched'
+    Assert-Test (-not [IO.File]::Exists((Join-Path $script:CasVault 'transaction.dpapi'))) 'Confirmed current account discards obsolete rollback snapshot'
+    Backup-CasTransaction
+    Write-CasAtomic $script:CasAuth (New-TestAuth 'mallory')
+    Assert-Throws { Complete-CasPendingWithCurrent } 'UNSAVED' 'Unknown current account cannot dismiss recovery'
+    Assert-Test ((Get-CasStatus).Pending) 'Unsafe confirmation preserves recovery marker'
+    Write-CasAtomic $script:CasAuth $b
+    Restore-CasTransaction
+    Backup-CasTransaction
+    Write-CasAtomic $script:CasConfig ([Text.Encoding]::UTF8.GetBytes('cli_auth_credentials_store = "keyring"'))
+    Assert-Throws { Complete-CasPendingWithCurrent } 'FILEMODE' 'Keyring mode cannot confirm local auth file'
+    Restore-CasTransaction
+    Assert-Test (Test-CasFileMode) 'Recovery restores file mode after unsafe confirmation'
     # Mock only OS app lifecycle. Switching uses real files and transactions.
     $script:FakeRunning=$false
     $script:FakeLaunch='success'
@@ -123,6 +158,11 @@ try {
     $selected=Invoke-CasSwitch 2 $fakeInstall
     Assert-Test ($selected.Email -eq 'bob@example.test' -and (Get-CasAccount (Read-CasLive)).Id -eq (Get-CasAccount $b).Id) 'Full switch commits selected local identity'
     Assert-Test (-not (Get-CasStatus).Pending) 'Successful switch clears pending marker'
+    Assert-Test (-not [IO.File]::Exists((Join-Path $script:CasVault 'transaction.dpapi'))) 'Successful switch discards stale recovery snapshot'
+    $selected=Invoke-CasSwitch 4 $fakeInstall
+    Assert-Test ($selected.Email -eq 'dana@example.test' -and (Get-CasStatus).Slots[3].IsCurrent) 'A fourth account can be selected and activated'
+    $null=Invoke-CasSwitch 2 $fakeInstall
+    Assert-Test ((Get-CasAccount (Read-CasLive)).Email -eq 'bob@example.test') 'Switching back from fourth account keeps second profile usable'
     foreach ($slowLaunch in @('delayed-window','delayed-process','delayed-path')) {
         $script:FakeLaunch=$slowLaunch
         $script:FakeStopCalls=0
@@ -135,7 +175,7 @@ try {
     $script:FakeLaunch='wrong-account'
     Assert-Throws { Invoke-CasSwitch 1 $fakeInstall } 'VERIFY' 'Unexpected post-launch identity rejected'
     Assert-Test ((Get-CasAccount (Read-CasLive)).Email -eq 'bob@example.test') 'Identity verification failure rolls back'
-    Write-CasAtomic (Join-Path $script:CasVault 'pending') ([byte[]]@(1))
+    Backup-CasTransaction
     Assert-Throws { Invoke-CasSwitch 1 $fakeInstall } 'PENDING' 'Interrupted transaction must recover before a new switch'
     Restore-CasTransaction
     # Isolated login should never rewrite the active home.

@@ -1,0 +1,58 @@
+name: Release Windows package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($file in @('Core.ps1', 'Codex-Switch.ps1', 'Test-Core.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) {
+              $errors | ForEach-Object { Write-Error "$file`: $($_.Message)" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Run synthetic-account tests
+        shell: powershell
+        run: .\Test-Core.ps1
+
+      - name: Package tagged source
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          $zipName = "Codex-Switch-$env:RELEASE_TAG.zip"
+          $zipPath = Join-Path $dist $zipName
+          git archive --format=zip --prefix=Codex-Switch/ --output=$zipPath HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create release archive.' }
+          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath ($zipPath + '.sha256') -Value "$hash  $zipName" -Encoding ascii
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $zipPath = Join-Path (Join-Path $PWD 'dist') "Codex-Switch-$env:RELEASE_TAG.zip"
+          gh release create $env:RELEASE_TAG $zipPath ($zipPath + '.sha256') --title "Codex Switch $env:RELEASE_TAG" --notes-file RELEASE_NOTES.md --verify-tag --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }

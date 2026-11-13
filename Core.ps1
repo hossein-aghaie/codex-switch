@@ -63,8 +63,29 @@ function Unprotect-CasData([byte[]]$Bytes) {
 function Save-CasSecret([string]$Path, [byte[]]$Bytes) { Write-CasAtomic $Path (Protect-CasData $Bytes) }
 function Read-CasSecret([string]$Path) { return ,(Unprotect-CasData ([IO.File]::ReadAllBytes($Path))) }
 function Get-CasSlotPath([int]$Slot) {
-    if ($Slot -notin @(1,2)) { throw 'CAS|SLOT|Choose account 1 or 2.' }
+    if ($Slot -lt 1) { throw 'CAS|SLOT|Choose a positive account number.' }
     return (Join-Path $script:CasVault "account-$Slot.dpapi")
+}
+
+function Get-CasSlotNumbers {
+    $numbers=@()
+    foreach ($file in [IO.Directory]::EnumerateFiles($script:CasVault, 'account-*.dpapi')) {
+        $match=[regex]::Match([IO.Path]::GetFileName($file), '^account-([1-9][0-9]*)\.dpapi$')
+        if ($match.Success) {
+            $number=0
+            if ([int]::TryParse($match.Groups[1].Value, [ref]$number)) { $numbers += $number }
+        }
+    }
+    return @($numbers | Sort-Object -Unique)
+}
+
+function Get-CasNextSlot {
+    $next=1
+    foreach ($number in @(Get-CasSlotNumbers)) {
+        if ($number -eq $next) { $next++ }
+        elseif ($number -gt $next) { break }
+    }
+    return $next
 }
 
 function Read-CasJwt([string]$Token) {
@@ -109,12 +130,13 @@ function Save-CasAccount([int]$Slot, [byte[]]$Bytes) {
     $target = Get-CasSlotPath $Slot
     if ([IO.File]::Exists($target)) {
         $old = Get-CasAccount (Read-CasSecret $target)
-        if ($old.Id -ne $incoming.Id) { throw 'CAS|DIFFERENT|This slot belongs to another account. Select the empty slot, or sign in to the same account.' }
+        if ($old.Id -ne $incoming.Id) { throw 'CAS|DIFFERENT|This row belongs to another account. Add a new account, or sign in to this same account.' }
     }
-    $otherPath = Get-CasSlotPath (3-$Slot)
-    if ([IO.File]::Exists($otherPath)) {
+    foreach ($otherSlot in @(Get-CasSlotNumbers)) {
+        if ($otherSlot -eq $Slot) { continue }
+        $otherPath = Get-CasSlotPath $otherSlot
         $other = Get-CasAccount (Read-CasSecret $otherPath)
-        if ($other.Id -eq $incoming.Id) { throw 'CAS|DUPLICATE|This account is already in the other slot. Choose the other browser account during sign-in.' }
+        if ($other.Id -eq $incoming.Id) { throw 'CAS|DUPLICATE|This account is already saved. Select its existing row.' }
     }
     Save-CasSecret $target $Bytes
     return $incoming
@@ -126,7 +148,7 @@ function Get-CasStatus {
         try { $live = Get-CasAccount (Read-CasLive) } catch { }
     }
     $slots = @()
-    foreach ($slot in @(1,2)) {
+    foreach ($slot in @(Get-CasSlotNumbers)) {
         $path = Get-CasSlotPath $slot
         $item = [pscustomobject]@{ Slot=$slot; State='empty'; Email=''; Id=''; IsCurrent=$false; Updated='' }
         if ([IO.File]::Exists($path)) {
@@ -305,10 +327,10 @@ function Sync-CasLive {
     if (-not [IO.File]::Exists($script:CasAuth)) { return }
     $bytes=Read-CasLive
     $account=Get-CasAccount $bytes
-    $matched=$false; $empty=0
-    foreach ($slot in @(1,2)) {
+    $matched=$false
+    foreach ($slot in @(Get-CasSlotNumbers)) {
         $path=Get-CasSlotPath $slot
-        if (-not [IO.File]::Exists($path)) { if ($empty -eq 0) { $empty=$slot }; continue }
+        if (-not [IO.File]::Exists($path)) { continue }
         $saved=Get-CasAccount (Read-CasSecret $path)
         if ($saved.Id -eq $account.Id) {
             # A fresh isolated sign-in may be newer than an old active cache.
@@ -319,8 +341,7 @@ function Sync-CasLive {
         }
     }
     if (-not $matched) {
-        if ($empty) { $null=Save-CasAccount $empty $bytes }
-        else { throw 'CAS|UNSAVED|The local login is not one of the two saved accounts. Save/resolve it before switching.' }
+        $null=Save-CasAccount (Get-CasNextSlot) $bytes
     }
 }
 
@@ -333,6 +354,8 @@ function Backup-CasTransaction {
 }
 
 function Restore-CasTransaction {
+    $pending=Join-Path $script:CasVault 'pending'
+    if (-not [IO.File]::Exists($pending)) { throw 'CAS|RECOVERY|There is no interrupted switch to recover.' }
     $path=Join-Path $script:CasVault 'transaction.dpapi'
     if (-not [IO.File]::Exists($path)) { throw 'CAS|RECOVERY|No desktop-switch recovery snapshot is available yet.' }
     $record=[Text.Encoding]::UTF8.GetString((Read-CasSecret $path)) | ConvertFrom-Json
@@ -343,15 +366,34 @@ function Restore-CasTransaction {
         if ($entry.Exists) { Write-CasAtomic $entry.Path ([Convert]::FromBase64String($entry.Data)) }
         elseif ([IO.File]::Exists($entry.Path)) { [IO.File]::Delete($entry.Path) }
     }
-    $pending=Join-Path $script:CasVault 'pending'
     if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) }
+    try { if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) } } catch { }
+}
+
+function Complete-CasPendingWithCurrent {
+    $pending=Join-Path $script:CasVault 'pending'
+    if (-not [IO.File]::Exists($pending)) { throw 'CAS|RECOVERY|There is no interrupted switch to finish.' }
+    if (-not (Test-CasFileMode)) { throw 'CAS|FILEMODE|The current Codex login is not configured to use auth.json.' }
+    $current=Get-CasAccount (Read-CasLive)
+    $found=$false
+    foreach ($slot in @(Get-CasSlotNumbers)) {
+        $path=Get-CasSlotPath $slot
+        try { $saved=Get-CasAccount (Read-CasSecret $path) } catch { continue }
+        if ($saved.Id -eq $current.Id) { $found=$true; break }
+    }
+    if (-not $found) { throw 'CAS|UNSAVED|The current local login does not match a saved account. Keep the recovery snapshot.' }
+    # The user has confirmed this account inside Codex. Do not close Codex or
+    # rewrite its live auth/config while it may be refreshing tokens.
+    [IO.File]::Delete($pending)
+    try { [IO.File]::Delete((Join-Path $script:CasVault 'transaction.dpapi')) } catch { }
+    return $current
 }
 
 function Invoke-CasSwitch([int]$Slot, $Installation, [switch]$Force) {
     $path=Get-CasSlotPath $Slot
     if (-not [IO.File]::Exists($path)) { throw 'CAS|EMPTY|Add this account before switching.' }
     $null=Get-CasAccount (Read-CasSecret $path)
-    if ([IO.File]::Exists((Join-Path $script:CasVault 'pending'))) { throw 'CAS|PENDING|A previous switch was interrupted. Use Restore first.' }
+    if ([IO.File]::Exists((Join-Path $script:CasVault 'pending'))) { throw 'CAS|PENDING|A previous switch was interrupted. Recover it before switching.' }
     # Parse config BEFORE closing apps or writing credentials.
     $text=''
     if ([IO.File]::Exists($script:CasConfig)) { $text=[IO.File]::ReadAllText($script:CasConfig) }
@@ -377,6 +419,7 @@ function Invoke-CasSwitch([int]$Slot, $Installation, [switch]$Force) {
         if ((Get-CasAccount $after).Id -ne $target.Id) { throw 'CAS|VERIFY|Codex changed the local account unexpectedly.' }
         Save-CasSecret $path $after
         [IO.File]::Delete((Join-Path $script:CasVault 'pending'))
+        try { [IO.File]::Delete((Join-Path $script:CasVault 'transaction.dpapi')) } catch { }
         return $target
     } catch {
         $originalError=$_
