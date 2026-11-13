@@ -1,3 +1,5 @@
+<div dir="rtl" lang="fa">
+
 # راهنمای Codex Switch
 
 Codex Switch یک ابزار محلی و غیررسمی با رابط فارسی برای نگه‌داشتن چند نشست Codex و انتخاب یکی از آن‌ها در ویندوز ۱۱ است. حساب‌ها را ادغام نمی‌کند و چت‌های ابری یک حساب را به حساب دیگر منتقل نمی‌کند.
@@ -11,9 +13,13 @@ Codex Switch یک ابزار محلی و غیررسمی با رابط فارسی
 
 برای پوشه Codex سفارشی، به جای `Start.cmd` این دستور را اجرا کن:
 
+</div>
+
 ```powershell
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Codex-Switch.ps1 -CodexHome 'D:\MyCodex'
 ```
+
+<div dir="rtl" lang="fa">
 
 این پوشه باید همان `CODEX_HOME` مورد استفادهٔ نصب دسکتاپ باشد؛ این پارامتر مسیر داخلی خود برنامه Codex را تغییر نمی‌دهد.
 
@@ -71,3 +77,5 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\Codex-Switch.ps1 
 یک محدودیت فنی فعلی این است که پس از بسته‌شدن Codex و پیش از نوشتن فایل ورود، پنجرهٔ کوتاهی برای اجرای دوبارهٔ Codex توسط برنامه‌ای دیگر وجود دارد. هنگام سوییچ، Codex را دستی باز نکن و بگذار فرایند کامل شود. این سناریو در تست‌های آفلاین پوشش داده نمی‌شود.
 
 فایل‌ها: `Codex-Switch.ps1` رابط WPF، `Core.ps1` منطق حساب و فایل، `Start.cmd` اجرا، `Test-Core.ps1` و `Test.cmd` آزمون، `SOURCES.md` یادداشت منابع، و `SHA256SUMS.txt` هش فایل‌های توزیع‌شده.
+
+</div>

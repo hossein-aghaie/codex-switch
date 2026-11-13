@@ -1,0 +1,29 @@
+name: Sync release notes
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - RELEASE_NOTES.md
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update the matching published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = Get-Content -LiteralPath RELEASE_NOTES.md -Raw -Encoding utf8
+          $match = [regex]::Match($notes, '(?m)^# Codex Switch (v\d+\.\d+\.\d+)\s*$')
+          if (-not $match.Success) { throw 'Release tag not found in RELEASE_NOTES.md.' }
+          $tag = $match.Groups[1].Value
+          gh release edit $tag --notes-file RELEASE_NOTES.md --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "Could not update release notes for $tag." }
